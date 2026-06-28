@@ -2,8 +2,13 @@
 #define H264_FRAMED_SOURCE_H
 
 #include <FramedSource.hh>
+#include <stdint.h>
+#include <stddef.h>
 
 typedef struct TQueue TQueue;
+
+/* MppPacket forward decl (from mpp_packet.h, opaque type) */
+typedef void* MppPacket;
 
 class H264FramedSource : public FramedSource {
 public:
@@ -19,9 +24,13 @@ protected:
 private:
     static void deliverFrame0(void* clientData);
     void deliverFrame();
+    void deliverOneNal();
 
-    TQueue*  fPktQueue;
-    unsigned fPollIntervalUs;
+    TQueue*       fPktQueue;
+    MppPacket     fCurPkt;       /* current packet being split */
+    const uint8_t* fCurPtr;      /* next byte to process */
+    size_t        fRemaining;    /* bytes remaining in current packet */
+    unsigned      fPollIntervalUs;
 };
 
 #ifdef __cplusplus

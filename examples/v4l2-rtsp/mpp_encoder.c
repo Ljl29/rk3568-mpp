@@ -1,12 +1,15 @@
 #include "mpp_encoder.h"
 #include "config.h"
 
+#define MODULE_TAG "mpp_encoder"
+
 #include "rk_mpi.h"
 #include "rk_venc_cfg.h"
 #include "rk_venc_cmd.h"
 #include "mpp_frame.h"
 #include "mpp_packet.h"
 #include "mpp_buffer.h"
+#include "mpp_meta.h"
 #include "mpp_common.h"
 
 #include <stdlib.h>
@@ -17,6 +20,8 @@ struct MppEncoder {
     MppApi         *mpi;
     MppEncCfg       cfg;
     MppEncRcMode    rc_mode;
+    MppBufferGroup  buf_grp;       /* DRM buffer group */
+    MppBuffer       pkt_buf;       /* reused output packet buffer */
     int             width;
     int             height;
     int             fps;
@@ -25,6 +30,7 @@ struct MppEncoder {
     uint8_t        *header_data;
     size_t          header_len;
     MppBuffer       header_buf;
+    size_t          packet_size;
 };
 
 MppEncoder* mpp_encoder_open(int width, int height, int fps, int bps,
@@ -37,6 +43,7 @@ MppEncoder* mpp_encoder_open(int width, int height, int fps, int bps,
     enc->fps    = fps;
     enc->bps    = bps;
     enc->gop    = gop;
+    enc->packet_size = (size_t)width * height;
 
     if (strcmp(rc_mode, "vbr") == 0)
         enc->rc_mode = MPP_ENC_RC_MODE_VBR;
@@ -45,8 +52,21 @@ MppEncoder* mpp_encoder_open(int width, int height, int fps, int bps,
     else
         enc->rc_mode = MPP_ENC_RC_MODE_CBR;
 
+    /* Create DRM buffer group BEFORE mpp_create/mpp_init (ref pattern) */
+    ret = mpp_buffer_group_get_internal(&enc->buf_grp, MPP_BUFFER_TYPE_DRM);
+    if (ret != MPP_OK) { LOG_ERR("mpp_buffer_group_get_internal failed ret=%d", ret); goto FAIL; }
+
+    ret = mpp_buffer_get(enc->buf_grp, &enc->pkt_buf, enc->packet_size);
+    if (ret != MPP_OK) { LOG_ERR("mpp_buffer_get pkt_buf failed ret=%d", ret); goto FAIL; }
+
     ret = mpp_create(&enc->ctx, &enc->mpi);
     if (ret != MPP_OK) { LOG_ERR("mpp_create failed ret=%d", ret); goto FAIL; }
+
+    {
+        MppPollType timeout = MPP_POLL_BLOCK;
+        ret = enc->mpi->control(enc->ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout);
+        if (ret != MPP_OK) { LOG_ERR("MPP_SET_OUTPUT_TIMEOUT failed ret=%d", ret); goto FAIL; }
+    }
 
     ret = mpp_init(enc->ctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC);
     if (ret != MPP_OK) { LOG_ERR("mpp_init failed ret=%d", ret); goto FAIL; }
@@ -135,13 +155,30 @@ int mpp_encoder_get_header(MppEncoder *enc, uint8_t **data, size_t *len) {
     return 0;
 }
 
-int mpp_encoder_encode(MppEncoder *enc, void *frame, void **packet) {
-    if (!enc || !frame || !packet) return -1;
-    MPP_RET ret = enc->mpi->encode(enc->ctx, (MppFrame)frame, (MppPacket*)packet);
+int mpp_encoder_put_frame(MppEncoder *enc, void *frame) {
+    if (!enc || !frame) return -1;
+    MPP_RET ret = enc->mpi->encode_put_frame(enc->ctx, (MppFrame)frame);
     if (ret != MPP_OK) {
-        LOG_ERR("encode failed ret=%d", ret);
+        LOG_ERR("encode_put_frame failed ret=%d", ret);
         return -1;
     }
+    return 0;
+}
+
+int mpp_encoder_get_packet(MppEncoder *enc, void **packet) {
+    if (!enc || !packet) return -1;
+
+    MppPacket pkt = NULL;
+    mpp_packet_init_with_buffer(&pkt, enc->pkt_buf);
+    mpp_packet_set_length(pkt, 0);
+
+    MPP_RET ret = enc->mpi->encode_get_packet(enc->ctx, &pkt);
+    if (ret != MPP_OK) {
+        LOG_ERR("encode_get_packet failed ret=%d", ret);
+        mpp_packet_deinit(&pkt);
+        return -1;
+    }
+    *packet = (void*)pkt;
     return 0;
 }
 
@@ -161,6 +198,14 @@ void mpp_encoder_close(MppEncoder *enc) {
         mpp_buffer_put(enc->header_buf);
         enc->header_buf  = NULL;
         enc->header_data = NULL;
+    }
+    if (enc->pkt_buf) {
+        mpp_buffer_put(enc->pkt_buf);
+        enc->pkt_buf = NULL;
+    }
+    if (enc->buf_grp) {
+        mpp_buffer_group_put(enc->buf_grp);
+        enc->buf_grp = NULL;
     }
     free(enc);
 }

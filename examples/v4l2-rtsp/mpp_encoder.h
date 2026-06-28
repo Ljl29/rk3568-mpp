@@ -11,7 +11,12 @@ MppEncoder* mpp_encoder_open(int width, int height, int fps, int bps,
 
 int  mpp_encoder_get_header(MppEncoder *enc, uint8_t **data, size_t *len);
 
-int  mpp_encoder_encode(MppEncoder *enc, void *frame, void **packet);
+/* ASYNC encode: put frame, then get packet (blocking) */
+int  mpp_encoder_put_frame(MppEncoder *enc, void *frame);
+
+/* Returns a packet whose data lives in enc's internal pkt_buf.
+ * Caller must copy data out before the next get_packet call. */
+int  mpp_encoder_get_packet(MppEncoder *enc, void **packet);
 
 void mpp_encoder_close(MppEncoder *enc);
 

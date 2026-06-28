@@ -7,11 +7,13 @@
 
 #include "mpp_frame.h"
 #include "mpp_packet.h"
+#include "mpp_buffer.h"
 #include "mpp_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h> 
 #include <getopt.h>
 #include <signal.h>
 #include <unistd.h>
@@ -32,7 +34,6 @@ typedef struct {
     MppEncoder   *enc;
     TQueue       *frame_queue;
     TQueue       *pkt_queue;
-    TQueue       *done_queue;
     int            width;
     int            height;
     int            drop;
@@ -41,6 +42,11 @@ typedef struct {
     int64_t        capture_drops;
     int64_t        encode_frames;
     int64_t        encode_errors;
+    int64_t        encode_zero_len;
+    FILE          *dump_fp;
+    int64_t        enc_frame_seq;
+    uint8_t       *hdr_data;
+    size_t         hdr_len;
 } ThreadCtx;
 
 /* ---- capture thread ---- */
@@ -55,12 +61,6 @@ static void* capture_thread(void *arg) {
             break;
         }
 
-        void *done_item = NULL;
-        while (tq_pop(tc->done_queue, &done_item, 0) == 0) {
-            int done_idx = (int)(intptr_t)done_item;
-            v4l2_capture_qbuf(tc->cam, done_idx);
-        }
-
         FrameInfo *fi = (FrameInfo*)calloc(1, sizeof(FrameInfo));
         if (!fi) { LOG_ERR("calloc FrameInfo failed"); break; }
         fi->v4l2_idx    = idx;
@@ -71,6 +71,7 @@ static void* capture_thread(void *arg) {
             fi->ts_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
         }
 
+        /* push to encode thread; if queue full, drop and re-QBUF */
         int push_ret = tq_push(tc->frame_queue, fi, tc->drop ? 100 : -1);
         if (push_ret != 0) {
             free(fi);
@@ -83,6 +84,46 @@ static void* capture_thread(void *arg) {
 
     tq_flush(tc->frame_queue);
     return NULL;
+}
+
+/* ---- NAL type names ---- */
+static const char* nal_name(int type) {
+    switch (type) {
+    case 1: return "NON-IDR";
+    case 5: return "IDR";
+    case 6: return "SEI";
+    case 7: return "SPS";
+    case 8: return "PPS";
+    default: return "?";
+    }
+}
+
+/* Log NAL units found in an Annex-B buffer by scanning start codes */
+static void log_nal_units(const char *label, const uint8_t *data, size_t len) {
+    char buf[256];
+    int off = 0;
+    off += snprintf(buf + off, sizeof(buf) - off, "%s %zuB:", label, len);
+    size_t i = 0;
+    int count = 0;
+    while (i + 3 < len && count < 8) {
+        int sc = 0;
+        if (data[i]==0 && data[i+1]==0 && data[i+2]==0 && data[i+3]==1) sc = 4;
+        else if (data[i]==0 && data[i+1]==0 && data[i+2]==1) sc = 3;
+        if (sc) {
+            if (i + (size_t)sc < len) {
+                int nt = data[i + sc] & 0x1F;
+                off += snprintf(buf + off, sizeof(buf) - off, " [%s]", nal_name(nt));
+                count++;
+            }
+            i += sc;
+        } else {
+            i++;
+        }
+    }
+    if (count >= 8) {
+        off += snprintf(buf + off, sizeof(buf) - off, " ...");
+    }
+    LOG("%s", buf);
 }
 
 /* ---- encode thread ---- */
@@ -98,7 +139,10 @@ static void* encode_thread(void *arg) {
         int ret = mpp_frame_init(&frame);
         if (ret != MPP_OK) {
             LOG_ERR("mpp_frame_init failed ret=%d", ret);
-            if (fi) { v4l2_capture_qbuf(tc->cam, fi->v4l2_idx); free(fi); }
+            if (fi) {
+                v4l2_capture_qbuf(tc->cam, fi->v4l2_idx);
+                free(fi);
+            }
             continue;
         }
 
@@ -108,32 +152,104 @@ static void* encode_thread(void *arg) {
         mpp_frame_set_ver_stride(frame, tc->height);
         mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
 
-        void *mpp_buf = v4l2_capture_get_mpp_buffer(tc->cam, fi->v4l2_idx);
-        mpp_frame_set_buffer(frame, (MppBuffer)mpp_buf);
+        /* Pass V4L2 EXT_DMA buffer directly — same as reference camera_source path */
+        MppBuffer v4l2_buf = (MppBuffer)v4l2_capture_get_mpp_buffer(tc->cam, fi->v4l2_idx);
+        mpp_frame_set_buffer(frame, v4l2_buf);
 
-        MppPacket packet = NULL;
-        ret = mpp_encoder_encode(tc->enc, frame, (void**)&packet);
-        if (ret != 0 || !packet) {
-            LOG_ERR("encode failed ret=%d", ret);
+        /* ASYNC: send frame to encoder */
+        ret = mpp_encoder_put_frame(tc->enc, frame);
+        mpp_frame_deinit(&frame);
+        if (ret != 0) {
+            LOG_ERR("encode_put_frame failed ret=%d", ret);
             tc->encode_errors++;
-            mpp_frame_deinit(&frame);
-            intptr_t idx_val = (intptr_t)fi->v4l2_idx;
-            tq_push(tc->done_queue, (void*)idx_val, 100);
+            v4l2_capture_qbuf(tc->cam, fi->v4l2_idx);
             free(fi);
             continue;
         }
 
-        tc->encode_frames++;
-        mpp_frame_deinit(&frame);
+        /* ASYNC: get encoded packet (blocking until ready) */
+        MppPacket enc_pkt = NULL;
+        ret = mpp_encoder_get_packet(tc->enc, (void**)&enc_pkt);
 
-        int push_ret = tq_push(tc->pkt_queue, packet, tc->drop ? 100 : -1);
-        if (push_ret != 0) {
-            mpp_packet_deinit(&packet);
+        /* QBUF: encoder is done with input frame */
+        v4l2_capture_qbuf(tc->cam, fi->v4l2_idx);
+
+        if (ret != 0 || !enc_pkt) {
+            LOG_ERR("encode_get_packet failed ret=%d", ret);
             tc->encode_errors++;
+            free(fi);
+            continue;
         }
 
-        intptr_t idx_val = (intptr_t)fi->v4l2_idx;
-        tq_push(tc->done_queue, (void*)idx_val, 100);
+        size_t enc_len = mpp_packet_get_length(enc_pkt);
+        void  *enc_data = mpp_packet_get_pos(enc_pkt);
+
+        if (enc_len == 0) {
+            tc->encode_zero_len++;
+            if (tc->encode_zero_len <= 5 || tc->encode_zero_len % 100 == 0)
+                LOG("DIAG zero-len #%lld", (long long)tc->encode_zero_len);
+            mpp_packet_deinit(&enc_pkt);
+            free(fi);
+            continue;
+        }
+
+        tc->enc_frame_seq++;
+        /* Log first 10 frames + every 30th for diagnostics */
+        if (tc->enc_frame_seq <= 10 || tc->enc_frame_seq % 30 == 0)
+            log_nal_units("ENC", (const uint8_t*)enc_data, enc_len);
+
+        /* Copy encoded data + optional SPS/PPS prepend for RTSP pipeline.
+         * For the very first frame, prepend SPS+PPS header (Annex-B)
+         * so the decoder always receives them in-band. */
+        MppBuffer out_buf = NULL;
+        size_t out_len = enc_len;
+        int is_first = (tc->enc_frame_seq == 1 && tc->hdr_data && tc->hdr_len > 0);
+        if (is_first) out_len = tc->hdr_len + enc_len;
+
+        mpp_buffer_get(NULL, &out_buf, out_len);
+        if (!out_buf) {
+            LOG_ERR("mpp_buffer_get for output copy failed");
+            mpp_packet_deinit(&enc_pkt);
+            tc->encode_errors++;
+            free(fi);
+            continue;
+        }
+        void *out_ptr = mpp_buffer_get_ptr(out_buf);
+        if (!out_ptr) {
+            LOG_ERR("mpp_buffer_get_ptr for output failed");
+            mpp_buffer_put(out_buf);
+            mpp_packet_deinit(&enc_pkt);
+            tc->encode_errors++;
+            free(fi);
+            continue;
+        }
+        if (is_first) {
+            memcpy(out_ptr, tc->hdr_data, tc->hdr_len);
+            memcpy((uint8_t*)out_ptr + tc->hdr_len, enc_data, enc_len);
+            log_nal_units("ENC1st", (const uint8_t*)out_ptr, out_len);
+        } else {
+            memcpy(out_ptr, enc_data, enc_len);
+        }
+
+        /* --dump: raw Annex-B to file for offline verification */
+        if (tc->dump_fp) {
+            fwrite(out_ptr, 1, out_len, tc->dump_fp);
+            fflush(tc->dump_fp);
+        }
+
+        MppPacket out_pkt = NULL;
+        mpp_packet_init_with_buffer(&out_pkt, out_buf);
+        mpp_packet_set_length(out_pkt, out_len);
+
+        mpp_packet_deinit(&enc_pkt);
+
+        int push_ret = tq_push(tc->pkt_queue, out_pkt, tc->drop ? 100 : -1);
+        if (push_ret != 0) {
+            mpp_packet_deinit(&out_pkt);
+            tc->encode_errors++;
+        } else {
+            tc->encode_frames++;
+        }
 
         free(fi);
     }
@@ -144,9 +260,10 @@ static void* encode_thread(void *arg) {
 
 /* ---- stats printer ---- */
 static void print_stats(ThreadCtx *tc) {
-    LOG("Stats: capture=%lld(+%lld drops) encode=%lld(+%lld errs) | fq=%d pq=%d",
+    LOG("Stats: capture=%lld(+%lld drops) encode=%lld(+%lld errs +%lld zero) | fq=%d pq=%d",
         (long long)tc->capture_frames, (long long)tc->capture_drops,
         (long long)tc->encode_frames, (long long)tc->encode_errors,
+        (long long)tc->encode_zero_len,
         tq_count(tc->frame_queue), tq_count(tc->pkt_queue));
 }
 
@@ -178,7 +295,8 @@ static int extract_sps_pps(uint8_t *annexb_data, size_t annexb_len,
                 break;
             next++; nal_len++;
         }
-        if (nal_len == 0) { nal_len = remaining; }
+        /* If no start code found, NAL runs to end of buffer */
+        if (nal_len + 2 >= remaining) { nal_len = remaining; }
 
         if (nal_len > 0) {
             int nal_type = p[0] & 0x1F;
@@ -208,6 +326,7 @@ static void usage(const char *prog) {
         "  --queue-len  N      Frame queue depth (default 5)\n"
         "  --drop       0|1    Drop on full: 0=block 1=drop (default 1)\n"
         "  --verbose    0|1    Verbose logging (default 0)\n"
+        "  --dump       PATH   Save raw H.264 Annex-B to file\n"
         "  --help              Print this help\n",
         prog);
 }
@@ -226,12 +345,13 @@ static int parse_args(int argc, char **argv, AppConfig *c) {
         {"queue-len", required_argument, 0, 'q'},
         {"drop",      required_argument, 0, 'p'},
         {"verbose",   required_argument, 0, 'v'},
+        {"dump",      required_argument, 0, 'D'},
         {"help",      no_argument,       0, '?'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:w:h:f:b:r:g:q:p:v:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:h:f:b:r:g:q:p:v:D:", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'd': strncpy(c->device, optarg, sizeof(c->device)-1); break;
         case 'w': c->width   = atoi(optarg); break;
@@ -243,6 +363,7 @@ static int parse_args(int argc, char **argv, AppConfig *c) {
         case 'q': c->queue_len = atoi(optarg); break;
         case 'p': c->drop    = atoi(optarg); break;
         case 'v': c->verbose = atoi(optarg); break;
+        case 'D': strncpy(c->dump_file, optarg, sizeof(c->dump_file)-1); break;
         case '?':
         default:  usage(argv[0]); exit(0);
         }
@@ -283,10 +404,9 @@ int main(int argc, char **argv) {
     }
     LOG("Extracted SPS (%d bytes) and PPS (%d bytes)", sps_len, pps_len);
 
-    TQueue frame_queue, pkt_queue, done_queue;
+    TQueue frame_queue, pkt_queue;
     if (tq_init(&frame_queue, cfg.queue_len) != 0 ||
-        tq_init(&pkt_queue, PKT_QUEUE_LEN) != 0 ||
-        tq_init(&done_queue, DEFAULT_V4L2_BUFS * 2) != 0) {
+        tq_init(&pkt_queue, PKT_QUEUE_LEN) != 0) {
         LOG_ERR("Failed to init queues");
         goto CLEANUP;
     }
@@ -297,17 +417,23 @@ int main(int argc, char **argv) {
     tc.enc          = enc;
     tc.frame_queue  = &frame_queue;
     tc.pkt_queue    = &pkt_queue;
-    tc.done_queue   = &done_queue;
     tc.width        = cfg.width;
     tc.height       = cfg.height;
     tc.drop         = cfg.drop;
     tc.verbose      = cfg.verbose;
+    tc.hdr_data     = hdr_data;   /* Annex-B SPS+PPS for in-band prepend */
+    tc.hdr_len      = hdr_len;
+    if (cfg.dump_file[0]) {
+        tc.dump_fp = fopen(cfg.dump_file, "wb");
+        if (!tc.dump_fp) LOG_ERR("Cannot open dump file %s: %s", cfg.dump_file, strerror(errno));
+        else LOG("Dumping raw H.264 to %s", cfg.dump_file);
+    }
 
     pthread_t t_cap, t_enc;
     pthread_create(&t_cap, NULL, capture_thread, &tc);
     pthread_create(&t_enc, NULL, encode_thread, &tc);
 
-    int rtsp_ret = rtsp_server_start((void*)&pkt_queue, 554, "live",
+    int rtsp_ret = rtsp_server_start((void*)&pkt_queue, 8554, "live",
                                      sps, sps_len, pps, pps_len, &g_stop);
     if (rtsp_ret != 0) {
         LOG_ERR("Failed to start RTSP server");
@@ -318,7 +444,7 @@ int main(int argc, char **argv) {
         goto CLEANUP;
     }
 
-    LOG("Pipeline running: %s -> %dx%d@%d -> H.264 %dbps -> rtsp://<ip>:554/live",
+    LOG("Pipeline running: %s -> %dx%d@%d -> H.264 %dbps -> rtsp://<ip>:8554/live",
         cfg.device, cfg.width, cfg.height, cfg.fps, cfg.bitrate);
 
     while (!g_stop) {
@@ -338,9 +464,9 @@ int main(int argc, char **argv) {
     LOG("Pipeline stopped.");
 
 CLEANUP:
+    if (tc.dump_fp) { fclose(tc.dump_fp); tc.dump_fp = NULL; }
     tq_destroy(&frame_queue);
     tq_destroy(&pkt_queue);
-    tq_destroy(&done_queue);
     mpp_encoder_close(enc);
     v4l2_capture_close(cam);
     return 0;

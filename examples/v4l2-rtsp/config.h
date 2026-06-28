@@ -37,6 +37,7 @@ typedef struct {
     int     queue_len;
     int     drop;              /* 0=block on full, 1=drop oldest on full */
     int     verbose;           /* 0=silent, 1=per-frame stats */
+    char    dump_file[256];    /* --dump: output raw H.264 to this file */
 } AppConfig;
 
 /* Passed through frame_queue */

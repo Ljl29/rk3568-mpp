@@ -1,0 +1,7 @@
+/home/ljl/rk3568/mpp-release/examples/v4l2-rtsp/.msys000000000014c00228e6a38f22a6abec/CMakeFiles/install/strip.dir
+/home/ljl/rk3568/mpp-release/examples/v4l2-rtsp/.msys000000000014c00228e6a38f22a6abec/CMakeFiles/edit_cache.dir
+/home/ljl/rk3568/mpp-release/examples/v4l2-rtsp/.msys000000000014c00228e6a38f22a6abec/CMakeFiles/v4l2_mpp_rtsp.dir
+/home/ljl/rk3568/mpp-release/examples/v4l2-rtsp/.msys000000000014c00228e6a38f22a6abec/CMakeFiles/install.dir
+/home/ljl/rk3568/mpp-release/examples/v4l2-rtsp/.msys000000000014c00228e6a38f22a6abec/CMakeFiles/rebuild_cache.dir
+/home/ljl/rk3568/mpp-release/examples/v4l2-rtsp/.msys000000000014c00228e6a38f22a6abec/CMakeFiles/list_install_components.dir
+/home/ljl/rk3568/mpp-release/examples/v4l2-rtsp/.msys000000000014c00228e6a38f22a6abec/CMakeFiles/install/local.dir
